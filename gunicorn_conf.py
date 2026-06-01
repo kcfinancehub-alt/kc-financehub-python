@@ -1,6 +1,8 @@
-import os
-
-bind = f"0.0.0.0:{os.environ.get('PORT', '5000')}"
-workers = 4  # Four parallel processes to handle 4 PDFs at once
+bind = "0.0.0.0:8000"
+workers = 4
 worker_class = "uvicorn.workers.UvicornWorker"
-timeout = 120  # Seconds before a stuck worker is killed
+timeout = 120
+keepalive = 5
+accesslog = "-"
+errorlog = "-"
+loglevel = "info"

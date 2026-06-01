@@ -1,83 +1,93 @@
-import os, re, logging
-from datetime import datetime
-import pdfplumber
-import pandas as pd
-import uvicorn
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+"""KC FinanceHub Python AI service – ratio analysis, CMA, Indian GAAP."""
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-app = FastAPI(title="KC FinanceHub Python Service")
-ALLOWED_MIME = "application/pdf"
-MAX_SIZE = 10 * 1024 * 1024  # 10 MB
+from __future__ import annotations
 
-def parse_bank_pdf(file_path: str) -> dict:
-    text = ""
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    if not text.strip():
-        raise ValueError("No text extracted from PDF")
-    lines = text.split("\n")
-    data = []
-    for line in lines:
-        date_match = re.search(r"(\d{2}[/-]\d{2}[/-]\d{2,4})", line)
-        if not date_match:
-            continue
-        parts = re.split(r"\s{2,}", line.strip())
-        if len(parts) < 3:
-            continue
-        date = parts[0]
-        particulars = " ".join(parts[1:-1])
-        amount_str = parts[-1].replace(",", "")
-        try:
-            amount = float(re.sub(r"[^\d.-]", "", amount_str))
-        except ValueError:
-            continue
-        data.append({"date": date, "description": particulars, "amount": amount})
-    if not data:
-        raise ValueError("No transactions parsed from PDF")
-    df = pd.DataFrame(data)
-    credits = df[df["amount"] > 0]["amount"].sum()
-    debits = df[df["amount"] < 0]["amount"].sum()
-    high_value_count = int((df["amount"].abs() > 50000).sum())
-    categories = df["description"].value_counts().head(10).to_dict()
-    return {
-        "total_credits": round(credits, 2),
-        "total_debits": round(abs(debits), 2),
-        "net_flow": round(credits - abs(debits), 2),
-        "transaction_count": len(df),
-        "high_value_count": high_value_count,
-        "top_categories": categories,
-    }
+import os
+from typing import Any
 
-@app.post("/parse-bank-pdf")
-async def parse_bank_pdf_endpoint(file: UploadFile = File(...)):
-    if file.content_type != ALLOWED_MIME:
-        raise HTTPException(status_code=422, detail="Invalid file type. Only PDF allowed.")
-    file_content = await file.read()
-    if len(file_content) > MAX_SIZE:
-        raise HTTPException(status_code=422, detail="File too large. Max 10MB.")
-    temp_path = f"/tmp/{datetime.now().timestamp()}_{file.filename}"
-    with open(temp_path, "wb") as f:
-        f.write(file_content)
-    try:
-        summary = parse_bank_pdf(temp_path)
-        os.remove(temp_path)
-        return JSONResponse(content=summary, status_code=200)
-    except Exception as e:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        logger.error(f"Parse error: {str(e)}")
-        raise HTTPException(status_code=422, detail=f"Invalid PDF: {str(e)}")
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel
+
+from agents.brain import generate_financial_report, validate_document
+
+app = FastAPI(title="KC FinanceHub AI Service", version="1.0.0")
+
+INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+
+
+def verify_internal(authorization: str = Header(default="")) -> None:
+    expected = f"Bearer {INTERNAL_SECRET}"
+    if not INTERNAL_SECRET or authorization != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+class ValidateRequest(BaseModel):
+    document_id: str
+    org_id: str
+
+
+class ReportJobRequest(BaseModel):
+    report_id: str
+    org_id: str
+    document_ids: list[str]
+    report_type: str
+    manual_override: bool = False
+    job_id: str
+
 
 @app.get("/health")
-async def health_check():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+def health() -> dict[str, str]:
+    return {"status": "ok", "service": "kc-financehub-ai"}
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+@app.post("/validate", dependencies=[Depends(verify_internal)])
+def validate(req: ValidateRequest) -> dict[str, str]:
+    validate_document(req.document_id, req.org_id)
+    return {"status": "validated", "document_id": req.document_id}
+
+
+@app.post("/jobs/report", dependencies=[Depends(verify_internal)])
+def enqueue_report(
+    req: ReportJobRequest,
+    background_tasks: BackgroundTasks,
+) -> dict[str, str]:
+    background_tasks.add_task(process_report_job, req.model_dump())
+    return {"status": "accepted", "job_id": req.job_id}
+
+
+def process_report_job(payload: dict[str, Any]) -> None:
+    report_id = payload["report_id"]
+    org_id = payload["org_id"]
+    document_ids = payload["document_ids"]
+    report_type = payload["report_type"]
+
+    content = generate_financial_report(
+        org_id=org_id,
+        document_ids=document_ids,
+        report_type=report_type,
+    )
+
+    update_report_in_supabase(report_id, content)
+
+
+def update_report_in_supabase(report_id: str, content: dict[str, Any]) -> None:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+
+    import httpx
+
+    url = f"{SUPABASE_URL}/rest/v1/financial_reports?id=eq.{report_id}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    body = {
+        "content": content,
+        "compliance_notes": content.get("compliance_notes", {}).get("body", ""),
+        "status": "pending_review",
+    }
+    httpx.patch(url, headers=headers, json=body, timeout=30.0)
