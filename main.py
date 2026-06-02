@@ -1,7 +1,10 @@
-from fastapi import FastAPI
+"""Entry point shim — the real application lives in app.py.
 
-app = FastAPI()
+This file exists so tools that expect a `main:app` import path work correctly.
+Import and re-export the FastAPI application from app.py to avoid duplicate
+app instances.
+"""
 
-@app.get("/")
-def home():
-    return {"status": "running"}
+from app import app  # noqa: F401  — re-exported for Gunicorn / uvicorn
+
+__all__ = ["app"]

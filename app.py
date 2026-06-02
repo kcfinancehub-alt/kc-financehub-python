@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -9,6 +10,8 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from agents.brain import generate_financial_report, validate_document
+
+logger = logging.getLogger("kc_financehub")
 
 app = FastAPI(title="KC FinanceHub AI Service", version="1.0.0")
 
@@ -58,25 +61,58 @@ def enqueue_report(
 
 
 def process_report_job(payload: dict[str, Any]) -> None:
+    """Background task that generates a financial report and writes it to Supabase.
+
+    Errors are caught, logged, and written back to the report row so the job
+    is never silently stuck.  Every failure must be surfaced to the Watchdog
+    agent via the error_detail column so admins can escalate.
+    """
     report_id = payload["report_id"]
     org_id = payload["org_id"]
     document_ids = payload["document_ids"]
     report_type = payload["report_type"]
 
-    content = generate_financial_report(
-        org_id=org_id,
-        document_ids=document_ids,
-        report_type=report_type,
-    )
+    try:
+        content = generate_financial_report(
+            org_id=org_id,
+            document_ids=document_ids,
+            report_type=report_type,
+        )
+        update_report_in_supabase(report_id, content)
 
-    update_report_in_supabase(report_id, content)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception(
+            "[process_report_job] Failed for report_id=%s: %s", report_id, exc
+        )
+        # Surface the error in Supabase so admins / Watchdog can react
+        update_report_in_supabase(
+            report_id,
+            {
+                "status_override": "error",
+                "compliance_notes": (
+                    "Report generation failed — manual review required. "
+                    f"Error: {exc!r}"
+                ),
+                "ratio_analysis": {},
+            },
+        )
+        raise  # Re-raise so FastAPI background task logs it too
 
 
 def update_report_in_supabase(report_id: str, content: dict[str, Any]) -> None:
+    """PATCH the financial_reports row in Supabase with the generated content.
+
+    Uses the service-role key (bypasses RLS) since this runs in the Python
+    backend, not in a user session.
+    """
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.warning(
+            "[update_report_in_supabase] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY "
+            "not set — skipping DB write."
+        )
         return
 
-    import httpx
+    import httpx  # local import so the module loads without httpx if not needed
 
     url = f"{SUPABASE_URL}/rest/v1/financial_reports?id=eq.{report_id}"
     headers = {
@@ -85,9 +121,17 @@ def update_report_in_supabase(report_id: str, content: dict[str, Any]) -> None:
         "Content-Type": "application/json",
         "Prefer": "return=minimal",
     }
+
+    # Determine final status — use status_override if the brain injected one
+    status = content.pop("status_override", "pending_review")
+
     body = {
         "content": content,
-        "compliance_notes": content.get("compliance_notes", {}).get("body", ""),
-        "status": "pending_review",
+        "compliance_notes": content.get("compliance_notes", {}).get("body", "")
+        if isinstance(content.get("compliance_notes"), dict)
+        else content.get("compliance_notes", ""),
+        "status": status,
     }
-    httpx.patch(url, headers=headers, json=body, timeout=30.0)
+
+    response = httpx.patch(url, headers=headers, json=body, timeout=30.0)
+    response.raise_for_status()  # Raise on 4xx/5xx so the caller can handle it

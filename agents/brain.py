@@ -19,6 +19,8 @@ def validate_document(document_id: str, org_id: str) -> None:
     """Data Gatekeeper validation stub – extend with extraction pipeline."""
     if not document_id or not org_id:
         raise ValueError("Invalid document or org")
+    
+    # TODO: Fetch document from Supabase, parse PDF, and update status in `documents` table.
 
 
 def generate_financial_report(
@@ -27,6 +29,8 @@ def generate_financial_report(
     report_type: str,
 ) -> dict[str, Any]:
     """Generate AI financial report with mandatory Compliance Notes."""
+    # TODO: Fetch real data from `document_ids`, process with LLM, and calculate dynamic ratios.
+    # Currently returning hardcoded dummy ratios for demonstration.
     ratios = {
         "current_ratio": 1.85,
         "quick_ratio": 1.22,
